@@ -49,7 +49,7 @@ class MonitorService : Service() {
                     if (System.currentTimeMillis() - idleSince > 5000) { stopSelf(); return@launch }   // grace period for a download submitted right now
                 } else idleSince = 0L
                 val text = if (opsOn) Ops.label.value else tr("Monitoring $n download${if (n > 1) "s" else ""}", "مراقبة $n تحميل")
-                lastText = text; Notifier.refreshSummary(this@MonitorService, text)
+                lastText = text; Notifier.refreshSummary(this@MonitorService, text); Notifier.refreshDownloads()
                 delay(3000)
             }
         }

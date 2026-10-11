@@ -449,7 +449,6 @@ object DownloadMonitor {
     fun syncNotifs() {
         for (x in DownloadRepo.all.value) {
             when {
-                x.state == DlState.PAUSED -> Notifier.cancel(x.notificationId)
                 !x.terminalNotified && (x.state == DlState.COMPLETED || x.state == DlState.FAILED || x.state == DlState.NOT_STARTED) -> {
                     DownloadRepo.update(x.id) { it.copy(terminalNotified = true) }       // persisted BEFORE posting: never twice
                     Notifier.result(x)
@@ -457,5 +456,6 @@ object DownloadMonitor {
                 x.state.active && x.state != DlState.SUBMITTING -> Notifier.watchTrouble(x)
             }
         }
+        Notifier.refreshDownloads()      // download cards: a paused download keeps its card (with Resume)
     }
 }

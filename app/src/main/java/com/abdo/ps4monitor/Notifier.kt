@@ -4,14 +4,21 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color
+import android.graphics.drawable.Icon
+import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Three channels:
- *  - "monitor": ONE ongoing notification (the foreground service's) that lists every active download and is tinted with the cover colour.
+ * Channels:
+ *  - "dl": ONE card per download (active or paused), in the style of a music player: media-style notification tinted with the game's cover colour,
+ *    the cover as picture, name, progress, size, remaining size / time, speed, and two buttons: Pause <-> Resume, and Delete (asks for a second tap).
+ *  - "monitor_min": the mandatory foreground-service notification, reduced to one quiet line (the cards above carry the details).
  *  - "alerts": a heads-up alert when a download has been interrupted for a while (one per incident, removed when it recovers).
  *  - "done": one notification per finished / failed download, grouped.
  * There is no per-download progress notification any more (that is what flooded the shade).
@@ -22,12 +29,20 @@ object Notifier {
     private val troubleSince = ConcurrentHashMap<Int, Long>()
     private val alerted = ConcurrentHashMap<Int, Long>()
     private const val ALERT_BASE = 500_000
+    const val ACT_PAUSE = "com.abdo.ps4monitor.NOTIF_PAUSE"
+    const val ACT_RESUME = "com.abdo.ps4monitor.NOTIF_RESUME"
+    const val ACT_DELETE = "com.abdo.ps4monitor.NOTIF_DELETE"
+    private const val CONFIRM_MS = 6_000L
+    private val confirmDel = ConcurrentHashMap<String, Long>()     // download id -> time until which the next Delete tap is the confirmation
+    private val posted = ConcurrentHashMap<Int, String>()          // notification id -> signature of the card currently shown
 
     fun init(c: Context) {
         ctx = c.applicationContext
         val m = ctx.getSystemService(NotificationManager::class.java)
         runCatching { m.deleteNotificationChannel("active"); m.deleteNotificationChannel("results") }     // channels of the old version
-        m.createNotificationChannel(NotificationChannel("monitor", tr("Download progress", "تقدّم التحميل"), NotificationManager.IMPORTANCE_LOW))
+        runCatching { m.deleteNotificationChannel("monitor") }     // channel of 4.2 (its notification was the big combined one)
+        m.createNotificationChannel(NotificationChannel("dl", tr("Downloads", "التحميلات"), NotificationManager.IMPORTANCE_LOW).apply { setShowBadge(false) })
+        m.createNotificationChannel(NotificationChannel("monitor_min", tr("Monitoring (service)", "المراقبة (الخدمة)"), NotificationManager.IMPORTANCE_MIN).apply { setShowBadge(false) })
         m.createNotificationChannel(NotificationChannel("alerts", tr("Interruptions", "انقطاع التحميل"), NotificationManager.IMPORTANCE_HIGH))
         m.createNotificationChannel(NotificationChannel("done", tr("Finished downloads", "التحميلات المنتهية"), NotificationManager.IMPORTANCE_DEFAULT))
     }
@@ -49,31 +64,17 @@ object Notifier {
         return "${gameTitle(d).take(34)} — $s"
     }
 
-    /** The mandatory foreground-service notification (id 1), rich: every active download, overall progress, cover colour. */
+    /** The mandatory foreground-service notification (id 1): one quiet line. The per-download cards carry the details. */
     fun summary(c: Context, fallback: String): Notification {
         val act = activeList()
-        val b = NotificationCompat.Builder(c, "monitor").setSmallIcon(R.drawable.ic_stat_ps4).setOngoing(true).setOnlyAlertOnce(true)
-            .setShowWhen(false).setContentIntent(pi())
-        if (act.isEmpty() || !Store.settings().notif) return b.setContentTitle("PS4 Monitor").setContentText(fallback).build()
-        val primary = act.firstOrNull { it.state == DlState.DOWNLOADING } ?: act.first()
+        val b = NotificationCompat.Builder(c, "monitor_min").setSmallIcon(R.drawable.ic_stat_ps4).setOngoing(true).setOnlyAlertOnce(true)
+            .setShowWhen(false).setContentIntent(pi()).setPriority(NotificationCompat.PRIORITY_MIN).setContentTitle("PS4 Monitor")
+        if (act.isEmpty() || !Store.settings().notif) return b.setContentText(fallback).build()
         val speed = act.filter { it.state == DlState.DOWNLOADING }.sumOf { it.speed }
         val trouble = act.any { it.state == DlState.STALLED || it.state == DlState.SERVER_DOWN }
-        val known = act.filter { (it.expectedSize ?: 0L) > 0L }
-        val pct = if (known.isNotEmpty()) (known.sumOf { it.currentSize } * 100L / known.sumOf { it.expectedSize ?: 1L }).toInt().coerceIn(0, 100) else null
-        val head = if (act.size == 1) gameTitle(primary) else tr("${act.size} downloads", "${act.size} تحميلات")
-        val eta = if (act.size == 1 && primary.etaSec >= 0) "ETA ${Fmt.dur(primary.etaSec)}" else null
-        val line = listOfNotNull(pct?.let { "$it%" }, if (speed > 0) Fmt.mbs(speed) else null, eta).joinToString(" • ")
-        val warn = tr("Interrupted - retrying", "منقطع - تجري إعادة المحاولة")
-        b.setContentTitle(head).setContentText(if (trouble) (if (line.isEmpty()) warn else "$line • $warn") else line.ifEmpty { fallback })
-        val inbox = NotificationCompat.InboxStyle()
-        act.take(5).forEach { inbox.addLine(oneLine(it)) }
-        if (act.size > 5) inbox.addLine("+${act.size - 5}")
-        psName(primary).ifEmpty { null }?.let { inbox.setSummaryText(it) }
-        b.setStyle(inbox)
-        if (pct != null) b.setProgress(100, pct, false) else b.setProgress(0, 0, true)
-        cover(primary)?.let { b.setLargeIcon(it) }
-        CoverColor.forDownload(primary)?.let { b.setColor(it); b.setColorized(true) }
-        return b.build()
+        val head = if (act.size == 1) tr("1 download", "تحميل واحد") else tr("${act.size} downloads", "${act.size} تحميلات")
+        val line = listOfNotNull(head, if (speed > 0) Fmt.mbs(speed) else null, if (trouble) tr("interrupted - retrying", "منقطع - تجري إعادة المحاولة") else null).joinToString(" • ")
+        return b.setContentText(line).build()
     }
     /** Re-posts the ongoing notification only when something visible changed. */
     fun refreshSummary(c: Context, fallback: String) {
@@ -141,7 +142,111 @@ object Notifier {
 
     private fun cancelAlert(id: Int) { runCatching { NotificationManagerCompat.from(ctx).cancel(id + ALERT_BASE) } }
     fun clearTrouble(id: Int) { troubleSince.remove(id); if (alerted.remove(id) != null) cancelAlert(id) }
-    fun cancel(id: Int) { clearTrouble(id); runCatching { NotificationManagerCompat.from(ctx).cancel(id) } }
+    fun cancel(id: Int) { clearTrouble(id); posted.remove(id); runCatching { NotificationManagerCompat.from(ctx).cancel(id) } }
+
+    // ---------------------------------------------------------------------------------------------
+    // Download cards (music-player style)
+    // ---------------------------------------------------------------------------------------------
+    private fun cardWanted(d: Download) = !d.superseded && d.state != DlState.SUBMITTING && (d.state.active || d.state == DlState.PAUSED)
+    private fun confirming(id: String) = (confirmDel[id] ?: 0L) > System.currentTimeMillis()
+
+    /** No cover yet: a stable colour taken from the file name, so the card is still coloured. */
+    private fun fallbackColor(d: Download): Int =
+        Color.HSVToColor(floatArrayOf(((d.displayName.hashCode() and 0x7fffffff) % 360).toFloat(), 0.55f, 0.55f))
+
+    private fun bar(fr: Float): String {
+        val n = 10
+        val f = (fr * n).toInt().coerceIn(0, n)
+        return "■".repeat(f) + "□".repeat(n - f)
+    }
+
+    /** line under the title, and the line in the header */
+    private fun cardTexts(d: Download): Pair<String, String> {
+        val total = d.expectedSize ?: 0L
+        val fr = d.frac
+        val left = if (total > 0L) (total - d.currentSize).coerceAtLeast(0L) else 0L
+        val size = if (total > 0L) "${Fmt.bytes(d.currentSize)} / ${Fmt.bytes(total)}" else Fmt.bytes(d.currentSize)
+        val text = listOfNotNull(if (fr != null) "${bar(fr)} ${d.pct}%" else null, size).joinToString(" • ")
+        val leftTxt = if (left > 0L) "${Fmt.bytes(left)} ${tr("left", "متبقٍ")}" else null
+        val sub = when (d.state) {
+            DlState.DOWNLOADING -> listOfNotNull(leftTxt, if (d.etaSec >= 0) Fmt.dur(d.etaSec) else null, if (d.speed > 0) Fmt.mbs(d.speed) else null).joinToString(" • ")
+            DlState.PAUSED -> listOfNotNull(tr("Paused", "متوقف مؤقتًا"), leftTxt).joinToString(" • ")
+            else -> listOfNotNull(d.state.label, leftTxt).joinToString(" • ")
+        }
+        return text to sub
+    }
+
+    private fun actionPi(act: String, d: Download): PendingIntent {
+        // PendingIntents are told apart by action / data, not by extras: the id goes into the data so two downloads never share one
+        val i = Intent(ctx, NotifActionReceiver::class.java).setAction(act).setData(Uri.parse("ps4mon://download/${d.id}/$act")).putExtra("id", d.id)
+        return PendingIntent.getBroadcast(ctx, d.notificationId * 4 + (if (act == ACT_DELETE) 1 else 0), i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+    }
+    private fun cardAction(icon: Int, title: String, pi: PendingIntent) = Notification.Action.Builder(Icon.createWithResource(ctx, icon), title, pi).build()
+
+    private fun card(d: Download): Notification {
+        val paused = d.state == DlState.PAUSED
+        val confirm = confirming(d.id)
+        val (text0, sub) = cardTexts(d)
+        val text = if (confirm) tr("Tap the bin again to delete this download and its file", "اضغط سلة المهملات مرة أخرى لحذف التحميل وملفه") else text0
+        val b = Notification.Builder(ctx, "dl")
+            .setSmallIcon(R.drawable.ic_stat_ps4)
+            .setContentTitle(gameTitle(d)).setContentText(text).setSubText(sub)
+            .setOngoing(!paused).setOnlyAlertOnce(true).setShowWhen(false).setContentIntent(pi())
+            .setColor(CoverColor.forDownload(d) ?: fallbackColor(d)).setColorized(true)
+            .addAction(if (paused) cardAction(R.drawable.ic_play, tr("Resume", "استئناف"), actionPi(ACT_RESUME, d))
+                       else cardAction(R.drawable.ic_pause, tr("Pause", "إيقاف مؤقت"), actionPi(ACT_PAUSE, d)))
+            .addAction(if (confirm) cardAction(R.drawable.ic_warning, tr("Confirm delete", "تأكيد الحذف"), actionPi(ACT_DELETE, d))
+                       else cardAction(R.drawable.ic_delete, tr("Delete", "حذف"), actionPi(ACT_DELETE, d)))
+            .setStyle(Notification.MediaStyle().setShowActionsInCompactView(0, 1))
+        cover(d)?.let { b.setLargeIcon(it) }
+        return b.build()
+    }
+
+    private fun cardSig(d: Download) =
+        "${d.state}:${d.pct}:${d.currentSize shr 26}:${(d.speed / 262144).toInt()}:${d.etaSec / 20}:${d.iconReady}:${d.pkgTitle}:${confirming(d.id)}:${Lang.isAr}"
+
+    /** Posts / updates / removes the cards. Cheap: a card is re-posted only when something visible changed. */
+    fun refreshDownloads() {
+        if (!::ctx.isInitialized) return
+        val all = DownloadRepo.all.value
+        if (!Store.settings().notif) { posted.keys.toList().forEach { cancel(it) }; return }
+        val ids = HashSet<Int>()
+        for (d in all) {
+            if (!cardWanted(d)) continue
+            ids += d.notificationId
+            val sig = cardSig(d)
+            if (posted[d.notificationId] == sig) continue
+            posted[d.notificationId] = sig
+            post(d.notificationId, card(d))
+        }
+        for (id in posted.keys.toList()) {
+            if (id in ids) continue
+            posted.remove(id)
+            // a finished download's card was already replaced by the result notification (same id); only remove cards that have no owner
+            val owner = all.firstOrNull { it.notificationId == id }
+            if (owner == null || owner.superseded) runCatching { NotificationManagerCompat.from(ctx).cancel(id) }
+        }
+    }
+
+    /** Buttons of a card (called by [NotifActionReceiver]). Same operations as the buttons in the app. */
+    fun onAction(action: String, id: String) {
+        if (!::ctx.isInitialized) return
+        if (DownloadRepo.get(id) == null) return
+        when (action) {
+            ACT_PAUSE -> Ops.launch(tr("Pausing…", "إيقاف مؤقت…")) { DownloadMonitor.pause(id) }
+            ACT_RESUME -> Ops.launch(tr("Preparing resume…", "تجهيز الاستئناف…")) { DownloadMonitor.resume(id) }
+            ACT_DELETE -> {
+                if (confirming(id)) {
+                    confirmDel.remove(id)
+                    Ops.launch(tr("Deleting…", "جارٍ الحذف…")) { DownloadMonitor.delete(id, true) }
+                } else {
+                    confirmDel[id] = System.currentTimeMillis() + CONFIRM_MS
+                    refreshDownloads()
+                    Handler(Looper.getMainLooper()).postDelayed({ refreshDownloads() }, CONFIRM_MS + 300L)
+                }
+            }
+        }
+    }
 
     private fun post(id: Int, n: Notification) {
         if (!::ctx.isInitialized) return

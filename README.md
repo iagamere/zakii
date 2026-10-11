@@ -1,4 +1,4 @@
-# PS4 Download Monitor 4.2
+# PS4 Download Monitor 4.3
 
 Open in Android Studio (JDK 17), sync Gradle, run. NOT compiled by the author (no Android SDK available): expect to fix a few compile errors on first sync.
 
@@ -19,6 +19,16 @@ Names, Fmt, Lang, and the UI (MainActivity, Ui, HomeUi, DownloadsUi, FilesUi, Pk
 Removed in 4.0: FTP, file-matching heuristics, Net size check, install-from-link, upload, text editor, save-to-phone, image preview,
 artwork scan, history screen, auto-rename/auto-install, adoption toggle, "stop monitoring", speed chart, untracked .tmp list, events list.
 
+
+## 4.3 (music-player style notifications)
+- **One card per download** (active or paused), styled like a music player: media-style notification tinted with the game's cover colour, the cover as
+  the picture, the name, a progress bar made of blocks with the percentage, `downloaded / total` size, size left, time left and speed.
+- **Two buttons:** Pause <-> Resume (it turns into Resume when the download is stopped, and the card stays so you can resume from it) and Delete.
+  Delete asks for a second tap within 6 seconds (the card text changes and the icon turns into a warning); it then removes the download
+  and its file from the PS4, the same as "delete with files" in the app.
+- The foreground-service notification became one quiet line (new channel "Monitoring (service)", importance minimum); the details are in the cards.
+- Finished / interrupted notifications are unchanged.
+- NOT compiled by the author (no Android SDK here), like the rest of this project: expect to check the first build.
 
 ## 4.2 (custom server edition)
 - **Server screen** (Settings > ezRemote Server): status (custom / original / unreachable), choose the server .elf once and send it to GoldHEN's BinLoader
